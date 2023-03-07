@@ -7,7 +7,7 @@ from typing import Optional
 import torch
 from torch import nn, Tensor
 from torch.autograd import grad
-from torch.optim import Adam
+from torch.optim.lr_scheduler import CosineAnnealingLR, ReduceLROnPlateau
 
 from adv_lib.utils.losses import difference_of_logits
 from adv_lib.utils.projections import l1_ball_euclidean_projection
@@ -160,14 +160,30 @@ def fmn(model: nn.Module,
     worst_norm = torch.maximum(inputs, 1 - inputs).flatten(1).norm(p=norm, dim=1)
     best_norm = worst_norm.clone()
     best_adv = inputs.clone()
+
     adv_found = torch.zeros(batch_size, dtype=torch.bool, device=device)
 
-    print(best_adv.shape)
+
+    α = α_final + (α_init - α_final)
+    γ = γ_final + (γ_init - γ_final)
+    α = torch.tensor(α)
+    γ = torch.tensor(γ)
+
+
+    optimizer = torch.optim.SGD
+    scheduler = CosineAnnealingLR
+
+    optimizer = optimizer([δ, α, γ], lr=0.05)
+    scheduler = scheduler(optimizer, steps)
 
     for i in range(steps):
-        """cosine = (1 + math.cos(math.pi * i / steps)) / 2
+        optimizer.zero_grad()
+
+        '''
+        cosine = (1 + math.cos(math.pi * i / steps)) / 2
         α = α_final + (α_init - α_final) * cosine
-        γ = γ_final + (γ_init - γ_final) * cosine"""
+        γ = γ_final + (γ_init - γ_final) * cosine
+        '''
 
 
         δ_norm = δ.data.flatten(1).norm(p=norm, dim=1)
@@ -175,27 +191,22 @@ def fmn(model: nn.Module,
         logits = model(adv_inputs)
         pred_labels = logits.argmax(dim=1)
 
+        print(f"α: {α} - γ: {γ}\n")
+
         if i == 0:
             labels_infhot = torch.zeros_like(logits).scatter_(1, labels.unsqueeze(1), float('inf'))
             logit_diff_func = partial(difference_of_logits, labels=labels, labels_infhot=labels_infhot)
 
         logit_diffs = logit_diff_func(logits=logits)
-        loss = (multiplier * logit_diffs)
-        # loss.backward()
+        # loss = (multiplier * logit_diffs)
+        loss = -(multiplier * logit_diffs)
+        loss.sum().backward()
+        # optimizer.step()
 
-        δ_grad = grad(loss.sum(), δ, only_inputs=True)
-        if i == 0:
-            print(δ_grad[0].shape)
-        δ_grad = δ_grad[0]
+        # old implement: δ_grad = grad(loss.sum(), δ, only_inputs=True)
 
-        '''
-        PGD implementation
-        loss = nn.CrossEntropyLoss()(model(X + delta), y)
-        loss.backward()
-        delta.data = (delta + X.shape[0]*alpha*delta.grad.data).clamp(-epsilon,epsilon)
-        delta.grad.zero_()
-        '''
-
+        # implement with gradients computed with backward
+        # δ_grad = δ.grad.data
 
         is_adv = (pred_labels == labels) if targeted else (pred_labels != labels)
         is_smaller = δ_norm < best_norm
@@ -210,7 +221,7 @@ def fmn(model: nn.Module,
                             torch.maximum(ε + 1, (ε * (1 + γ)).floor_()))
             ε.clamp_(min=0)
         else:
-            distance_to_boundary = loss.detach().abs() / δ_grad.flatten(1).norm(p=dual, dim=1).clamp_(min=1e-12)
+            distance_to_boundary = loss.detach().abs() / δ.grad.data.flatten(1).norm(p=dual, dim=1).clamp_(min=1e-12)
             ε = torch.where(is_adv,
                             torch.minimum(ε * (1 - γ), best_norm),
                             torch.where(adv_found, ε * (1 + γ), δ_norm + distance_to_boundary))
@@ -219,16 +230,30 @@ def fmn(model: nn.Module,
         ε = torch.minimum(ε, worst_norm)
 
         # normalize gradient
+        # grad_l2_norms = δ_grad.flatten(1).norm(p=2, dim=1).clamp_(min=1e-12)
+        # δ_grad.div_(batch_view(grad_l2_norms))
+
+
+        # normalize gradient
+        '''
+        δ_grad = δ.grad.data
         grad_l2_norms = δ_grad.flatten(1).norm(p=2, dim=1).clamp_(min=1e-12)
         δ_grad.div_(batch_view(grad_l2_norms))
+        '''
 
         # gradient ascent step
-        δ.data.add_(δ_grad, alpha=α)
+        # δ.data.add_(-δ_grad, alpha=α)
+
+        optimizer.step()
 
         # project in place
         projection(δ=δ.data, ε=ε)
 
         # clamp
         δ.data.add_(inputs).clamp_(min=0, max=1).sub_(inputs)
+
+        # δ.grad.zero_()
+        scheduler.step()
+        print(scheduler.get_last_lr())
 
     return best_adv
