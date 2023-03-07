@@ -162,10 +162,13 @@ def fmn(model: nn.Module,
     best_adv = inputs.clone()
     adv_found = torch.zeros(batch_size, dtype=torch.bool, device=device)
 
+    print(best_adv.shape)
+
     for i in range(steps):
-        cosine = (1 + math.cos(math.pi * i / steps)) / 2
+        """cosine = (1 + math.cos(math.pi * i / steps)) / 2
         α = α_final + (α_init - α_final) * cosine
-        γ = γ_final + (γ_init - γ_final) * cosine
+        γ = γ_final + (γ_init - γ_final) * cosine"""
+
 
         δ_norm = δ.data.flatten(1).norm(p=norm, dim=1)
         adv_inputs = inputs + δ
@@ -178,8 +181,21 @@ def fmn(model: nn.Module,
 
         logit_diffs = logit_diff_func(logits=logits)
         loss = (multiplier * logit_diffs)
+        # loss.backward()
 
-        δ_grad = grad(loss.sum(), δ, only_inputs=True)[0]
+        δ_grad = grad(loss.sum(), δ, only_inputs=True)
+        if i == 0:
+            print(δ_grad[0].shape)
+        δ_grad = δ_grad[0]
+
+        '''
+        PGD implementation
+        loss = nn.CrossEntropyLoss()(model(X + delta), y)
+        loss.backward()
+        delta.data = (delta + X.shape[0]*alpha*delta.grad.data).clamp(-epsilon,epsilon)
+        delta.grad.zero_()
+        '''
+
 
         is_adv = (pred_labels == labels) if targeted else (pred_labels != labels)
         is_smaller = δ_norm < best_norm
@@ -214,8 +230,5 @@ def fmn(model: nn.Module,
 
         # clamp
         δ.data.add_(inputs).clamp_(min=0, max=1).sub_(inputs)
-
-
-
 
     return best_adv
