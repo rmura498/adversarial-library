@@ -7,7 +7,7 @@ from typing import Optional
 import torch
 from torch import nn, Tensor
 from torch.autograd import grad
-from torch.optim.lr_scheduler import CosineAnnealingLR, ReduceLROnPlateau
+from torch.optim.lr_scheduler import CosineAnnealingLR, ReduceLROnPlateau, CosineAnnealingWarmRestarts
 
 from adv_lib.utils.losses import difference_of_logits
 from adv_lib.utils.projections import l1_ball_euclidean_projection
@@ -75,10 +75,10 @@ def fmn(model: nn.Module,
         norm: float,
         targeted: bool = False,
         steps: int = 10,
-        α_init: float = 1.0,
-        α_final: Optional[float] = None,
-        γ_init: float = 0.05,
-        γ_final: float = 0.001,
+        alpha_init: float = 1.0,
+        alpha_final: Optional[float] = None,
+        gamma_init: float = 0.05,
+        gamma_final: float = 0.001,
         starting_points: Optional[Tensor] = None,
         binary_search_steps: int = 10) -> Tensor:
     """
@@ -98,14 +98,14 @@ def fmn(model: nn.Module,
         Whether to perform a targeted attack or not.
     steps : int
         Number of optimization steps.
-    α_init : float
+    alpha_init : float
         Initial step size.
-    α_final : float
+    alpha_final : float
         Final step size after cosine annealing.
-    γ_init : float
-        Initial factor by which ε is modified: ε = ε * (1 + or - γ).
-    γ_final : float
-        Final factor, after cosine annealing, by which ε is modified.
+    gamma_init : float
+        Initial factor by which epsilon is modified: epsilon = epsilon * (1 + or - gamma).
+    gamma_final : float
+        Final factor, after cosine annealing, by which epsilon is modified.
     starting_points : Tensor
         Optional warm-start for the attack.
     binary_search_steps : int
@@ -128,7 +128,7 @@ def fmn(model: nn.Module,
     batch_size = len(inputs)
     batch_view = lambda tensor: tensor.view(batch_size, *[1] * (inputs.ndim - 1))
     dual, projection, mid_point = _dual_projection_mid_points[norm]
-    α_final = α_init / 100 if α_final is None else α_final
+    alpha_final = alpha_init / 100 if alpha_final is None else alpha_final
     multiplier = 1 if targeted else -1
 
     # If starting_points is provided, search for the boundary
@@ -139,22 +139,22 @@ def fmn(model: nn.Module,
         lower_bound = torch.zeros(batch_size, device=device)
         upper_bound = torch.ones(batch_size, device=device)
         for _ in range(binary_search_steps):
-            ε = (lower_bound + upper_bound) / 2
-            mid_points = mid_point(x0=inputs, x1=starting_points, ε=ε)
+            epsilon = (lower_bound + upper_bound) / 2
+            mid_points = mid_point(x0=inputs, x1=starting_points, ε=epsilon)
             pred_labels = model(mid_points).argmax(dim=1)
             is_adv = (pred_labels == labels) if targeted else (pred_labels != labels)
-            lower_bound = torch.where(is_adv, lower_bound, ε)
-            upper_bound = torch.where(is_adv, ε, upper_bound)
+            lower_bound = torch.where(is_adv, lower_bound, epsilon)
+            upper_bound = torch.where(is_adv, epsilon, upper_bound)
 
-        δ = mid_point(x0=inputs, x1=starting_points, ε=ε) - inputs
+        delta = mid_point(x0=inputs, x1=starting_points, ε=epsilon) - inputs
     else:
-        δ = torch.zeros_like(inputs)
-    δ.requires_grad_(True)
+        delta = torch.zeros_like(inputs)
+    delta.requires_grad_(True)
 
     if norm == 0:
-        ε = torch.ones(batch_size, device=device) if starting_points is None else δ.flatten(1).norm(p=0, dim=0)
+        epsilon = torch.ones(batch_size, device=device) if starting_points is None else delta.flatten(1).norm(p=0, dim=0)
     else:
-        ε = torch.full((batch_size,), float('inf'), device=device)
+        epsilon = torch.full((batch_size,), float('inf'), device=device)
 
     # Init trackers
     worst_norm = torch.maximum(inputs, 1 - inputs).flatten(1).norm(p=norm, dim=1)
@@ -164,34 +164,44 @@ def fmn(model: nn.Module,
     adv_found = torch.zeros(batch_size, dtype=torch.bool, device=device)
 
 
-    α = α_final + (α_init - α_final)
-    γ = γ_final + (γ_init - γ_final)
-    α = torch.tensor(α)
-    γ = torch.tensor(γ)
-
+    # proviamo ad ottimizare epsilon
+    epsilon.requires_grad_()
+    print(f"Initial epsilon value: {epsilon.data.norm(p=norm)}")
 
     optimizer = torch.optim.SGD
     scheduler = CosineAnnealingLR
 
-    optimizer = optimizer([δ, α, γ], lr=0.05)
-    scheduler = scheduler(optimizer, steps)
+    #optimizer = optimizer([delta, epsilon], lr=100)
+    # optimizer = optimizer([delta], lr=100)
+
+    delta_optim = optimizer([delta], lr=alpha_init)
+    epsilon_optim = optimizer([epsilon], lr=gamma_init)
+
+    delta_scheduler = scheduler(delta_optim, T_max=steps, eta_min=alpha_final)
+    epsilon_scheduler = scheduler(epsilon_optim, T_max=steps, eta_min=gamma_final)
+
+    # warm restarts (?)
+    # delta_scheduler = scheduler(delta_optim, T_0=steps, eta_min=alpha_final)
+    # epsilon_scheduler = scheduler(epsilon_optim, T_0=steps, eta_min=gamma_final)
 
     for i in range(steps):
-        optimizer.zero_grad()
+        # optimizer.zero_grad()
+        delta_optim.zero_grad()
+        epsilon_optim.zero_grad()
 
-        '''
-        cosine = (1 + math.cos(math.pi * i / steps)) / 2
-        α = α_final + (α_init - α_final) * cosine
-        γ = γ_final + (γ_init - γ_final) * cosine
-        '''
+        # cosine = (1 + math.cos(math.pi * i / steps)) / 2
+        # alpha = alpha_final + (alpha_init - alpha_final) * cosine
+        # gamma = gamma_final + (gamma_init - gamma_final) * cosine
 
 
-        δ_norm = δ.data.flatten(1).norm(p=norm, dim=1)
-        adv_inputs = inputs + δ
+        delta_norm = delta.data.flatten(1).norm(p=norm, dim=1)
+        adv_inputs = inputs + delta
         logits = model(adv_inputs)
         pred_labels = logits.argmax(dim=1)
 
-        print(f"α: {α} - γ: {γ}\n")
+        # print(f"alpha: {alpha} - gamma: {gamma}\n")
+        # print(epsilon.data.norm(p=norm), "\n")
+        # print(epsilon, "\n")
 
         if i == 0:
             labels_infhot = torch.zeros_like(logits).scatter_(1, labels.unsqueeze(1), float('inf'))
@@ -203,31 +213,37 @@ def fmn(model: nn.Module,
         loss.sum().backward()
         # optimizer.step()
 
-        # old implement: δ_grad = grad(loss.sum(), δ, only_inputs=True)
+        # old implement: δ_grad = grad(loss.sum(), delta, only_inputs=True)
 
         # implement with gradients computed with backward
-        # δ_grad = δ.grad.data
+        # δ_grad = delta.grad.data
 
         is_adv = (pred_labels == labels) if targeted else (pred_labels != labels)
-        is_smaller = δ_norm < best_norm
+        is_smaller = delta_norm < best_norm
         is_both = is_adv & is_smaller
         adv_found.logical_or_(is_adv)
-        best_norm = torch.where(is_both, δ_norm, best_norm)
+        best_norm = torch.where(is_both, delta_norm, best_norm)
         best_adv = torch.where(batch_view(is_both), adv_inputs.detach(), best_adv)
 
-        if norm == 0:
-            ε = torch.where(is_adv,
-                            torch.minimum(torch.minimum(ε - 1, (ε * (1 - γ)).floor_()), best_norm),
-                            torch.maximum(ε + 1, (ε * (1 + γ)).floor_()))
-            ε.clamp_(min=0)
-        else:
-            distance_to_boundary = loss.detach().abs() / δ.grad.data.flatten(1).norm(p=dual, dim=1).clamp_(min=1e-12)
-            ε = torch.where(is_adv,
-                            torch.minimum(ε * (1 - γ), best_norm),
-                            torch.where(adv_found, ε * (1 + γ), δ_norm + distance_to_boundary))
+        gamma = epsilon_scheduler.get_last_lr()[0]
+        alpha = delta_scheduler.get_last_lr()[0]
+        print(f"alpha: {alpha} - gamma: {gamma}\n")
 
-        # clip ε
-        ε = torch.minimum(ε, worst_norm)
+
+        if norm == 0:
+            epsilon = torch.where(is_adv,
+                            torch.minimum(torch.minimum(epsilon - 1, (epsilon * (1 - gamma)).floor_()), best_norm),
+                            torch.maximum(epsilon + 1, (epsilon * (1 + gamma)).floor_()))
+            epsilon.clamp_(min=0)
+        else:
+            distance_to_boundary = loss.detach().abs() / delta.grad.data.flatten(1).norm(p=dual, dim=1).clamp_(min=1e-12)
+            epsilon = torch.where(is_adv,
+                            torch.minimum(epsilon * (1 - gamma), best_norm),
+                            torch.where(adv_found, epsilon * (1 + gamma), delta_norm + distance_to_boundary))
+        
+
+        # clip epsilon
+        epsilon = torch.minimum(epsilon, worst_norm)
 
         # normalize gradient
         # grad_l2_norms = δ_grad.flatten(1).norm(p=2, dim=1).clamp_(min=1e-12)
@@ -236,24 +252,30 @@ def fmn(model: nn.Module,
 
         # normalize gradient
         '''
-        δ_grad = δ.grad.data
+        δ_grad = delta.grad.data
         grad_l2_norms = δ_grad.flatten(1).norm(p=2, dim=1).clamp_(min=1e-12)
         δ_grad.div_(batch_view(grad_l2_norms))
         '''
 
         # gradient ascent step
-        # δ.data.add_(-δ_grad, alpha=α)
 
-        optimizer.step()
+        # optimizer.step()
+        delta_optim.step()
+        epsilon_optim.step()
+        #delta.data.add_(-delta.grad.data, alpha=alpha)
+        #delta = -delta.grad.data + alpha
 
         # project in place
-        projection(δ=δ.data, ε=ε)
+        projection(δ=delta.data, ε=epsilon)
 
         # clamp
-        δ.data.add_(inputs).clamp_(min=0, max=1).sub_(inputs)
+        delta.data.add_(inputs).clamp_(min=0, max=1).sub_(inputs)
 
-        # δ.grad.zero_()
-        scheduler.step()
-        print(scheduler.get_last_lr())
+        # delta.grad.zero_()
+        # scheduler.step()
+        delta_scheduler.step()
+        epsilon_scheduler.step()
+
+        # print(f"{delta.flatten(1).norm(p=2, dim=1).clamp_(min=1e-12)}\n")
 
     return best_adv
