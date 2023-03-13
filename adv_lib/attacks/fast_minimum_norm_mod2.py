@@ -12,6 +12,9 @@ from torch.optim.lr_scheduler import CosineAnnealingLR, ReduceLROnPlateau, Cosin
 from adv_lib.utils.losses import difference_of_logits
 from adv_lib.utils.projections import l1_ball_euclidean_projection
 
+import matplotlib.pyplot as plt
+import numpy as np
+
 
 def l0_projection_(δ: Tensor, ε: Tensor) -> Tensor:
     """In-place l0 projection"""
@@ -68,6 +71,33 @@ def linf_mid_points(x0: Tensor, x1: Tensor, ε: Tensor) -> Tensor:
     δ = (x1 - x0).flatten(1)
     return x0 + torch.maximum(torch.minimum(δ, ε, out=δ), -ε, out=δ).view_as(x0)
 
+
+def normalize_01(data):
+    return (data - np.min(data)) / (np.max(data) - np.min(data))
+
+
+def plot_loss_epsilon_over_steps(loss, epsilon, steps, normalize=True):
+    if normalize:
+        loss = normalize_01(loss)
+        epsilon = normalize_01(epsilon)
+
+    fig1, ax1 = plt.subplots()
+    ax1.plot(
+        torch.arange(0, steps),
+        loss,
+        label="Loss"
+    )
+    ax1.plot(
+        torch.arange(0, steps),
+        epsilon,
+        label="Epsilon"
+    )
+    ax1.grid()
+    ax1.set_xlabel("Steps")
+    ax1.set_ylabel("Loss/Epsilon")
+    fig1.legend()
+
+    plt.show()
 
 def fmn(model: nn.Module,
         inputs: Tensor,
@@ -163,74 +193,44 @@ def fmn(model: nn.Module,
 
     adv_found = torch.zeros(batch_size, dtype=torch.bool, device=device)
 
-
-    # proviamo ad ottimizare epsilon
     epsilon.requires_grad_()
     print(f"Initial epsilon value: {epsilon.data.norm(p=norm)}")
 
     optimizer = torch.optim.SGD
     scheduler = CosineAnnealingLR
 
-    #optimizer = optimizer([delta, epsilon], lr=100)
-    # optimizer = optimizer([delta], lr=100)
-
     delta_optim = optimizer([delta], lr=alpha_init)
-    epsilon_optim = optimizer([epsilon], lr=gamma_init)
-
     delta_scheduler = scheduler(delta_optim, T_max=steps, eta_min=alpha_final)
-    epsilon_scheduler = scheduler(epsilon_optim, T_max=steps, eta_min=gamma_final)
 
-    # warm restarts (?)
-    # delta_scheduler = scheduler(delta_optim, T_0=steps, eta_min=alpha_final)
-    # epsilon_scheduler = scheduler(epsilon_optim, T_0=steps, eta_min=gamma_final)
-
-    # [1] provare senza l'optimizer di epsilon, calcolare gamma all'interno
-    # [2] controllare campione per campione per vedere se rende la stessa distanza
-    # [3] tracciare loss e distanza ad ogni iterazione (per fare il plot)
-
-    # [4] ultimo sample ottimizato e distanza (a mano)
-
-    # vedere se funziona meglio di auto-attack ???
+    loss_per_iter = []
+    epsilon_per_iter = []
 
     for i in range(steps):
-        # optimizer.zero_grad()
         delta_optim.zero_grad()
-        epsilon_optim.zero_grad()
 
-        # cosine = (1 + math.cos(math.pi * i / steps)) / 2
-        # alpha = alpha_final + (alpha_init - alpha_final) * cosine
-        # gamma = gamma_final + (gamma_init - gamma_final) * cosine
-
+        cosine = (1 + math.cos(math.pi * i / steps)) / 2
+        gamma = gamma_final + (gamma_init - gamma_final) * cosine
 
         delta_norm = delta.data.flatten(1).norm(p=norm, dim=1)
         adv_inputs = inputs + delta
         logits = model(adv_inputs)
         pred_labels = logits.argmax(dim=1)
 
-        # POSSIBILE OTTIMIZAZIONE DI EPSILON
-        # minimo funzione epsilon vicino al boundary
-        # funzione che può portare una riduzione di epsilon dove c'è il boundary
-        # (forse optimizer con momentum)
-
-
-        # print(f"alpha: {alpha} - gamma: {gamma}\n")
-        # print(epsilon.data.norm(p=norm), "\n")
-        # print(epsilon, "\n")
-
         if i == 0:
             labels_infhot = torch.zeros_like(logits).scatter_(1, labels.unsqueeze(1), float('inf'))
             logit_diff_func = partial(difference_of_logits, labels=labels, labels_infhot=labels_infhot)
 
         logit_diffs = logit_diff_func(logits=logits)
-        # loss = (multiplier * logit_diffs)
         loss = -(multiplier * logit_diffs)
+        # add the loss to the list for printing purposes
+
+        # print(f"epsilon: {torch.linalg.norm(epsilon)}\n")
+        # print(f"delta: {delta.shape}\n")
+
+        loss_per_iter.append(loss.sum().clone().detach().numpy())
+        epsilon_per_iter.append(torch.linalg.norm(epsilon).clone().detach().numpy())
+
         loss.sum().backward()
-        # optimizer.step()
-
-        # old implement: δ_grad = grad(loss.sum(), delta, only_inputs=True)
-
-        # implement with gradients computed with backward
-        # δ_grad = delta.grad.data
 
         is_adv = (pred_labels == labels) if targeted else (pred_labels != labels)
         is_smaller = delta_norm < best_norm
@@ -239,10 +239,8 @@ def fmn(model: nn.Module,
         best_norm = torch.where(is_both, delta_norm, best_norm)
         best_adv = torch.where(batch_view(is_both), adv_inputs.detach(), best_adv)
 
-        gamma = epsilon_scheduler.get_last_lr()[0]
         alpha = delta_scheduler.get_last_lr()[0]
-        print(f"alpha: {alpha} - gamma: {gamma}\n")
-
+        #print(f"alpha: {alpha} - gamma: {gamma}\n")
 
         if norm == 0:
             epsilon = torch.where(is_adv,
@@ -258,24 +256,11 @@ def fmn(model: nn.Module,
 
         # clip epsilon
         epsilon = torch.minimum(epsilon, worst_norm)
-
         # normalize gradient
-        # grad_l2_norms = δ_grad.flatten(1).norm(p=2, dim=1).clamp_(min=1e-12)
-        # δ_grad.div_(batch_view(grad_l2_norms))
-
-
         # normalize gradient
-        '''
-        δ_grad = delta.grad.data
-        grad_l2_norms = δ_grad.flatten(1).norm(p=2, dim=1).clamp_(min=1e-12)
-        δ_grad.div_(batch_view(grad_l2_norms))
-        '''
-
         # gradient ascent step
 
-        # optimizer.step()
         delta_optim.step()
-        epsilon_optim.step()
         #delta.data.add_(-delta.grad.data, alpha=alpha)
         #delta = -delta.grad.data + alpha
 
@@ -288,12 +273,15 @@ def fmn(model: nn.Module,
         # delta.grad.zero_()
         # scheduler.step()
         delta_scheduler.step()
-        epsilon_scheduler.step()
 
         # mostrare epsilon al variare delle iterazioni
         # printare la loss
         # printare la distanza
 
-        # print(f"{delta.flatten(1).norm(p=2, dim=1).clamp_(min=1e-12)}\n")
+    plot_loss_epsilon_over_steps(
+        loss=loss_per_iter,
+        epsilon=epsilon_per_iter,
+        steps=steps
+    )
 
     return best_adv
