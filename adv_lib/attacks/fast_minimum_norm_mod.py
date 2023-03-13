@@ -184,6 +184,14 @@ def fmn(model: nn.Module,
     # delta_scheduler = scheduler(delta_optim, T_0=steps, eta_min=alpha_final)
     # epsilon_scheduler = scheduler(epsilon_optim, T_0=steps, eta_min=gamma_final)
 
+    # [1] provare senza l'optimizer di epsilon, calcolare gamma all'interno
+    # [2] controllare campione per campione per vedere se rende la stessa distanza
+    # [3] tracciare loss e distanza ad ogni iterazione (per fare il plot)
+
+    # [4] ultimo sample ottimizato e distanza (a mano)
+
+    # vedere se funziona meglio di auto-attack ???
+
     for i in range(steps):
         # optimizer.zero_grad()
         delta_optim.zero_grad()
@@ -198,6 +206,12 @@ def fmn(model: nn.Module,
         adv_inputs = inputs + delta
         logits = model(adv_inputs)
         pred_labels = logits.argmax(dim=1)
+
+        # POSSIBILE OTTIMIZAZIONE DI EPSILON
+        # minimo funzione epsilon vicino al boundary
+        # funzione che può portare una riduzione di epsilon dove c'è il boundary
+        # (forse optimizer con momentum)
+
 
         # print(f"alpha: {alpha} - gamma: {gamma}\n")
         # print(epsilon.data.norm(p=norm), "\n")
@@ -275,6 +289,10 @@ def fmn(model: nn.Module,
         # scheduler.step()
         delta_scheduler.step()
         epsilon_scheduler.step()
+
+        # mostrare epsilon al variare delle iterazioni
+        # printare la loss
+        # printare la distanza
 
         # print(f"{delta.flatten(1).norm(p=2, dim=1).clamp_(min=1e-12)}\n")
 
